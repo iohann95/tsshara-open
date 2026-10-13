@@ -1,6 +1,13 @@
 package com.tsshara.app.ui
 
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -24,7 +31,8 @@ import com.tsshara.app.R
 import com.tsshara.app.data.PrefsManager
 import com.tsshara.app.network.ApiClient
 import com.tsshara.app.service.NotificationHelper
-import com.tsshara.app.service.UpsMonitorWorker
+import com.tsshara.app.service.UpsMonitorService
+import com.tsshara.app.ui.theme.Green700
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -131,6 +139,8 @@ fun SettingsScreen(
             }
 
             if (monitoringEnabled) {
+                BatteryOptimizationCard()
+
                 OutlinedTextField(
                     value = pollInterval,
                     onValueChange = { pollInterval = it.filter { c -> c.isDigit() } },
@@ -196,7 +206,8 @@ fun SettingsScreen(
             // ── Save ──
             Button(
                 onClick = {
-                    val intervalSec = pollInterval.toIntOrNull() ?: PrefsManager.DEFAULT_POLL_SECONDS
+                    val intervalSec = (pollInterval.toIntOrNull() ?: PrefsManager.DEFAULT_POLL_SECONDS)
+                        .coerceIn(2, 3600) // never 0 (tight loop) nor absurdly long
                     val newSettings = settings.copy(
                         monitoringEnabled = monitoringEnabled,
                         pollIntervalSeconds = intervalSec,
@@ -209,17 +220,22 @@ fun SettingsScreen(
                         notifConnectionRestored = notifConnectionRestored,
                         notifTestRunning = notifTestRunning,
                     )
-                    scope.launch { prefsManager.save(newSettings) }
-                    onLanguageChange(language)
+                    // Note: language is already applied by LanguageSelector.onSelect —
+                    // applying it again here would recreate the Activity mid-save.
+                    scope.launch {
+                        // Persist FIRST, then start/stop the service. Starting it before
+                        // the DataStore write completes is a race: the service reads the
+                        // old settings (e.g. monitoringEnabled=false) and stops itself.
+                        prefsManager.save(newSettings)
 
-                    // Schedule or cancel monitoring
-                    if (monitoringEnabled && newSettings.hasConfiguredDevices) {
-                        UpsMonitorWorker.schedule(context, intervalSec)
-                    } else {
-                        UpsMonitorWorker.cancel(context)
+                        if (monitoringEnabled && newSettings.hasConfiguredDevices) {
+                            UpsMonitorService.start(context)
+                        } else {
+                            UpsMonitorService.stop(context)
+                        }
+
+                        Toast.makeText(context, context.getString(R.string.settings_saved), Toast.LENGTH_SHORT).show()
                     }
-
-                    Toast.makeText(context, context.getString(R.string.settings_saved), Toast.LENGTH_SHORT).show()
                 },
                 modifier = Modifier
                     .fillMaxWidth()
@@ -487,6 +503,77 @@ private fun DeviceDialog(
             }
         }
     )
+}
+
+/**
+ * Battery optimization (Doze) throttles background network access and was the
+ * main reason alerts arrived late or never when the app wasn't on screen.
+ * This card asks the user to exempt the app so the monitoring service keeps
+ * polling reliably in the background.
+ */
+@Composable
+private fun BatteryOptimizationCard() {
+    val context = LocalContext.current
+    val powerManager = remember { context.getSystemService(Context.POWER_SERVICE) as PowerManager }
+    var isExempt by remember {
+        mutableStateOf(powerManager.isIgnoringBatteryOptimizations(context.packageName))
+    }
+
+    // Re-check when the user returns from the system dialog
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        isExempt = powerManager.isIgnoringBatteryOptimizations(context.packageName)
+    }
+
+    if (isExempt) {
+        Text(
+            text = stringResource(R.string.settings_battery_opt_ok),
+            style = MaterialTheme.typography.bodySmall,
+            color = Green700
+        )
+    } else {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.35f)
+            )
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = stringResource(R.string.settings_battery_opt_title),
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = stringResource(R.string.settings_battery_opt_desc),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedButton(
+                    onClick = {
+                        launcher.launch(
+                            Intent(
+                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:${context.packageName}")
+                            )
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.BatteryAlert, null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(stringResource(R.string.settings_battery_opt_button))
+                }
+            }
+        }
+    }
 }
 
 @Composable

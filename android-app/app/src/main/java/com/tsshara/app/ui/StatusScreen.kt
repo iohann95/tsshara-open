@@ -12,7 +12,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
-import androidx.compose.material3.MenuAnchorType
+import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -30,6 +30,7 @@ import com.tsshara.app.network.ApiClient
 import com.tsshara.app.ui.theme.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -54,8 +55,9 @@ fun StatusScreen(settings: PrefsManager.AppSettings) {
 
     fun refresh() {
         val device = selectedDevice ?: return
+        if (isLoading) return // avoid overlapping refreshes (auto + manual)
+        isLoading = true
         scope.launch {
-            isLoading = true
             errorMsg = null
             withContext(Dispatchers.IO) {
                 // Fire all 3 requests in parallel instead of sequentially
@@ -157,8 +159,8 @@ fun StatusScreen(settings: PrefsManager.AppSettings) {
 
                         // Test commands
                         selectedDevice?.let { device ->
-                            TestsCard(device)
-                            BeepCard(device, statusData)
+                            TestsCard(device, onCommandSent = { refresh() })
+                            BeepCard(device, statusData, onCommandSent = { refresh() })
                         }
 
                         if (lastUpdate.isNotBlank()) {
@@ -201,7 +203,7 @@ private fun DeviceSelector(
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
             modifier = Modifier
                 .fillMaxWidth()
-                .menuAnchor(MenuAnchorType.PrimaryNotEditable),
+                .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable),
             colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors()
         )
         ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
@@ -219,7 +221,7 @@ private fun DeviceSelector(
 }
 
 @Composable
-private fun TestsCard(device: PrefsManager.UpsDevice) {
+private fun TestsCard(device: PrefsManager.UpsDevice, onCommandSent: () -> Unit) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var runningTest by remember { mutableStateOf<String?>(null) }
@@ -242,6 +244,11 @@ private fun TestsCard(device: PrefsManager.UpsDevice) {
             else
                 context.getString(R.string.test_failed, result.error ?: "")
             Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            if (result.success) {
+                // Give the monitor a moment to poll the new state, then refresh
+                delay(1_500)
+                onCommandSent()
+            }
         }
     }
 
@@ -271,7 +278,7 @@ private fun TestsCard(device: PrefsManager.UpsDevice) {
 }
 
 @Composable
-private fun BeepCard(device: PrefsManager.UpsDevice, statusData: JSONObject?) {
+private fun BeepCard(device: PrefsManager.UpsDevice, statusData: JSONObject?, onCommandSent: () -> Unit) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var isRunning by remember { mutableStateOf(false) }
@@ -295,6 +302,11 @@ private fun BeepCard(device: PrefsManager.UpsDevice, statusData: JSONObject?) {
             else
                 context.getString(R.string.test_failed, result.error ?: "")
             Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            if (result.success) {
+                // Refresh so the displayed beep state reflects the toggle
+                delay(1_500)
+                onCommandSent()
+            }
         }
     }
 

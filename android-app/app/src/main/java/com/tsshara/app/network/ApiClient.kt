@@ -5,8 +5,12 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.IOException
 import java.io.InputStreamReader
+import java.net.ConnectException
 import java.net.HttpURLConnection
+import java.net.NoRouteToHostException
+import java.net.PortUnreachableException
 import java.net.URL
+import java.net.UnknownHostException
 import java.util.Base64
 
 /**
@@ -14,8 +18,11 @@ import java.util.Base64
  * Supports Basic Auth and connects to the tsshara-cli REST API.
  * Now operates on UpsDevice instead of global Settings.
  *
- * Includes automatic retry on I/O failures (e.g. NAT hairpin, transient
- * network issues) — browsers retry transparently but HttpURLConnection does not.
+ * GET requests are retried on any I/O failure (safe — they're idempotent).
+ * POST requests are only retried when the connection was NEVER established
+ * (ConnectException, UnknownHostException, ...). Retrying a POST after a
+ * read timeout could execute the UPS command TWICE — e.g. toggling the
+ * beep twice (ending in the wrong state) or firing duplicate battery tests.
  */
 object ApiClient {
 
@@ -30,6 +37,18 @@ object ApiClient {
     private const val READ_TIMEOUT = 12_000     // per attempt
     private const val MAX_RETRIES = 3           // total attempts on I/O errors
     private const val RETRY_DELAY_MS = 1_500L   // delay between retries
+
+    /**
+     * Returns true when the failure happened before the request could have
+     * reached the server, so retrying can never duplicate a command.
+     */
+    private fun isConnectPhaseFailure(e: IOException): Boolean = when (e) {
+        is ConnectException,
+        is UnknownHostException,
+        is NoRouteToHostException,
+        is PortUnreachableException -> true
+        else -> false
+    }
 
     /** GET request with automatic retry on connection failures. */
     fun get(device: PrefsManager.UpsDevice, endpoint: String): ApiResult {
@@ -47,7 +66,7 @@ object ApiClient {
                 applyAuth(conn, device)
                 return readResponse(conn)
             } catch (e: IOException) {
-                // Connection / read failed — retry
+                // Connection / read failed — GET is idempotent, safe to retry
                 lastError = e.message ?: "I/O error"
                 if (attempt < MAX_RETRIES) {
                     try { Thread.sleep(RETRY_DELAY_MS) } catch (_: InterruptedException) { break }
@@ -60,7 +79,10 @@ object ApiClient {
         return ApiResult(success = false, error = lastError)
     }
 
-    /** POST request (empty body) with automatic retry on connection failures. */
+    /**
+     * POST request (empty body). Only retried while the connection was never
+     * established — never after the request may have reached the server.
+     */
     fun post(device: PrefsManager.UpsDevice, endpoint: String): ApiResult {
         var lastError: String = "Connection failed"
         for (attempt in 1..MAX_RETRIES) {
@@ -80,6 +102,11 @@ object ApiClient {
                 return readResponse(conn)
             } catch (e: IOException) {
                 lastError = e.message ?: "I/O error"
+                // The command may already have been executed by the server
+                // (e.g. response read timed out) — do NOT resend it.
+                if (!isConnectPhaseFailure(e)) {
+                    return ApiResult(success = false, error = lastError)
+                }
                 if (attempt < MAX_RETRIES) {
                     try { Thread.sleep(RETRY_DELAY_MS) } catch (_: InterruptedException) { break }
                 }

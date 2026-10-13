@@ -1,16 +1,42 @@
-*.iml
-.gradle
-/local.properties
-/.idea
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+# Gradle
+.gradle/
+build/
+/app/build/
+/app/debug/
+/app/release/
+
+# Kotlin 2.x session/metadata dir
+.kotlin/
+
+# Local configuration (machine-specific SDK path)
 local.properties
-/app/build
-/app/release
+
+# IDE (Android Studio / IntelliJ)
+*.iml
+.idea/
+captures/
+.navigation/
+
+# Native builds
+.externalNativeBuild/
+.cxx/
+
+# Build artifacts
 *.apk
 *.aab
+*.ap_
+*.dex
+
+# Signing — never commit keys/secrets
 *.jks
 *.keystore
+keystore.properties
+
+# Profiling / reports / misc
+*.hprof
+*.log
+lint-report.*
+
+# OS
+.DS_Store
+Thumbs.db

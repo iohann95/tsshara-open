@@ -21,7 +21,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.lifecycleScope
 import com.tsshara.app.data.PrefsManager
-import com.tsshara.app.service.UpsMonitorWorker
+import com.tsshara.app.service.UpsMonitorService
 import com.tsshara.app.ui.AboutScreen
 import com.tsshara.app.ui.SettingsScreen
 import com.tsshara.app.ui.StatusScreen
@@ -53,7 +53,7 @@ class MainActivity : ComponentActivity() {
 
             // Re-schedule monitoring if enabled
             if (settings.monitoringEnabled && settings.hasConfiguredDevices) {
-                UpsMonitorWorker.schedule(this@MainActivity, settings.pollIntervalSeconds)
+                UpsMonitorService.start(this@MainActivity)
             }
         }
 

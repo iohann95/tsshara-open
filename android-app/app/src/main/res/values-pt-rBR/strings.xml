@@ -137,6 +137,12 @@
     <string name="settings_notif_connection_restored">✅ Conexão Restaurada</string>
     <string name="settings_notif_test_running">🔄 Teste em Andamento</string>
 
+    <!-- Battery optimization -->
+    <string name="settings_battery_opt_title">Confiabilidade em segundo plano</string>
+    <string name="settings_battery_opt_desc">A otimização de bateria do Android pode suspender o monitoramento e atrasar alertas. Isente este app para que o monitoramento continue funcionando em segundo plano.</string>
+    <string name="settings_battery_opt_button">Desativar otimização de bateria</string>
+    <string name="settings_battery_opt_ok">✅ Otimização de bateria desativada — monitoramento em segundo plano confiável</string>
+
     <!-- Notifications -->
     <string name="notif_channel_name">Alertas do Nobreak</string>
     <string name="notif_channel_desc">Notificações sobre mudanças no status do nobreak</string>

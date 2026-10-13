@@ -8,6 +8,7 @@ import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.work.WorkManager
 import com.tsshara.app.R
 import com.tsshara.app.data.PrefsManager
 import com.tsshara.app.network.ApiClient
@@ -30,12 +31,24 @@ import org.json.JSONObject
  * get throttled and their network requests fail, causing false
  * "connection error" notifications. A foreground service guarantees
  * uninterrupted network access.
+ *
+ * ## Why specialUse (not dataSync)?
+ * Android 15+ forbids starting a dataSync foreground service from a
+ * BOOT_COMPLETED receiver — auto-start after reboot would always crash.
+ * Continuous hardware monitoring is exactly what FOREGROUND_SERVICE_SPECIAL_USE
+ * is for, and it has no boot-time restriction.
  */
 class UpsMonitorService : Service() {
 
     companion object {
         private const val TAG = "UpsMonitorService"
         private const val FOREGROUND_NOTIF_ID = 900
+
+        /** Unique work name used by old versions that polled via WorkManager. */
+        private const val LEGACY_WORK_NAME = "ups_monitor"
+
+        /** Minimum allowed poll interval — prevents a 0s tight loop. */
+        private const val MIN_POLL_SECONDS = 2
 
         // Debounce thresholds (consecutive polls required before notifying)
         private const val THRESHOLD_CONNECTION_ERROR = 3
@@ -44,11 +57,19 @@ class UpsMonitorService : Service() {
         private const val THRESHOLD_IMMEDIATE = 1
 
         fun start(context: Context) {
+            // Cancel any legacy WorkManager chain from older app versions
+            // so two pollers never run at the same time.
+            runCatching {
+                WorkManager.getInstance(context).cancelUniqueWork(LEGACY_WORK_NAME)
+            }
             val intent = Intent(context, UpsMonitorService::class.java)
             context.startForegroundService(intent)
         }
 
         fun stop(context: Context) {
+            runCatching {
+                WorkManager.getInstance(context).cancelUniqueWork(LEGACY_WORK_NAME)
+            }
             context.stopService(Intent(context, UpsMonitorService::class.java))
         }
 
@@ -118,21 +139,37 @@ class UpsMonitorService : Service() {
     }
 
     private fun promoteToForeground() {
-        val notification = NotificationCompat.Builder(this, NotificationHelper.CHANNEL_ID_MONITOR)
+        ServiceCompat.startForeground(
+            this,
+            FOREGROUND_NOTIF_ID,
+            buildForegroundNotification(online = true),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        )
+    }
+
+    private fun buildForegroundNotification(online: Boolean): android.app.Notification =
+        NotificationCompat.Builder(this, NotificationHelper.CHANNEL_ID_MONITOR)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle(getString(R.string.notif_monitor_title))
-            .setContentText(getString(R.string.notif_monitor_body))
+            .setContentTitle(
+                getString(
+                    if (online) R.string.notif_monitor_title
+                    else R.string.notif_monitor_title_no_internet
+                )
+            )
+            .setContentText(
+                getString(
+                    if (online) R.string.notif_monitor_body
+                    else R.string.notif_monitor_body_no_internet
+                )
+            )
             .setOngoing(true)
             .setSilent(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
 
-        ServiceCompat.startForeground(
-            this,
-            FOREGROUND_NOTIF_ID,
-            notification,
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-        )
+    private fun updateForegroundNotification(online: Boolean) {
+        val manager = getSystemService(android.app.NotificationManager::class.java)
+        manager.notify(FOREGROUND_NOTIF_ID, buildForegroundNotification(online))
     }
 
     // ── Polling loop ───────────────────────────────────────────────────────
@@ -143,6 +180,7 @@ class UpsMonitorService : Service() {
 
         serviceScope.launch {
             Log.i(TAG, "Polling loop started")
+            var lastOnline = true
             while (isActive) {
                 val settings = prefs.settingsFlow.first()
 
@@ -152,7 +190,15 @@ class UpsMonitorService : Service() {
                     return@launch
                 }
 
-                if (!networkMonitor.isInternetAvailable) {
+                val online = networkMonitor.isInternetAvailable
+                if (online != lastOnline) {
+                    // Reflect connectivity in the persistent notification so the
+                    // user can tell monitoring is alive but waiting for network.
+                    updateForegroundNotification(online)
+                    lastOnline = online
+                }
+
+                if (!online) {
                     Log.d(TAG, "No internet — skipping poll cycle")
                 } else {
                     try {
@@ -162,7 +208,7 @@ class UpsMonitorService : Service() {
                     }
                 }
 
-                delay(settings.pollIntervalSeconds * 1000L)
+                delay(settings.pollIntervalSeconds.coerceAtLeast(MIN_POLL_SECONDS) * 1000L)
             }
         }
     }
@@ -172,12 +218,15 @@ class UpsMonitorService : Service() {
     private suspend fun pollDevices(settings: PrefsManager.AppSettings) {
         val stateMap = mutableMapOf<String, String>()
 
-        for (device in settings.devices) {
-            if (!device.isConfigured) continue
+        settings.devices.forEachIndexed { deviceIdx, device ->
+            if (!device.isConfigured) {
+                // Preserve any previous debounce state instead of silently dropping it
+                settings.lastNotifState[device.id]?.let { stateMap[device.id] = it }
+                return@forEachIndexed
+            }
 
             val result = ApiClient.getStatus(device)
             val deviceName = device.displayName
-            val deviceIdx = settings.devices.indexOf(device)
             val baseNotifId = 1000 + deviceIdx * 10
 
             // ── Determine polled status ─────────────────────────────
@@ -191,9 +240,8 @@ class UpsMonitorService : Service() {
                 if (result.httpCode == 0 && !networkMonitor.checkNow()) {
                     Log.d(TAG, "${device.displayName}: HTTP failed but no internet — skipping")
                     // Preserve previous debounce state unchanged for this device
-                    val prevRaw = settings.lastNotifState[device.id]
-                    if (prevRaw != null) stateMap[device.id] = prevRaw
-                    continue
+                    settings.lastNotifState[device.id]?.let { stateMap[device.id] = it }
+                    return@forEachIndexed
                 }
                 polledStatus = if (result.httpCode == 0) "CONNECTION_ERROR" else "API_NO_DATA"
                 responseData = null

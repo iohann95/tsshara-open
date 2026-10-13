@@ -7,7 +7,12 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- specialUse (not dataSync): Android 15+ forbids starting a dataSync FGS
+         from BOOT_COMPLETED, which would break auto-start after reboot. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Lets the app ask the user to exempt it from battery optimization (Doze),
+         which otherwise throttles network access and delays UPS alerts. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:name=".TssharaApp"
@@ -33,7 +38,12 @@
         <service
             android:name=".service.UpsMonitorService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:stopWithTask="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Continuous UPS (nobreak) hardware monitoring over the local network, with user-facing power-failure alerts." />
+        </service>
 
         <receiver
             android:name=".service.BootReceiver"

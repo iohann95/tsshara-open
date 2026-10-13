@@ -652,6 +652,7 @@ class SerialPortManager:
         Como o monitor e o CLI usam a porta por períodos muito curtos (< 2s)
         e a liberam entre operações, o retry geralmente funciona rapidamente.
         """
+        busy_max_retries = max(1, busy_max_retries)  # garante ao menos 1 tentativa
         for attempt in range(busy_max_retries):
             try:
                 return self.abrir(timeout)
@@ -732,13 +733,13 @@ class SerialPortManager:
         portas_ocupadas = []
 
         for porta in portas:
+            manager = None
             try:
                 manager = SerialPortManager(porta)
                 manager.abrir(timeout=5.0)
                 manager.escrever("Q1\r")
                 time.sleep(0.5)
                 resposta = manager.ler(timeout=5.0)
-                manager.fechar()
 
                 if resposta:
                     logger.debug(f"Nobreak detectado na porta {porta}")
@@ -748,6 +749,11 @@ class SerialPortManager:
                 portas_ocupadas.append(porta)
             except Exception:
                 continue
+            finally:
+                # Fecha sempre, mesmo em exceção — um handle vazado deixaria a
+                # porta ocupada para as próximas operações deste processo.
+                if manager:
+                    manager.fechar()
 
         # Se encontramos portas ocupadas mas nenhuma responsiva, a porta ocupada
         # provavelmente é o nobreak sendo usado pelo serviço de monitoramento ou outra instância.
@@ -1199,6 +1205,7 @@ class TestHandler:
 
     def executar_comando(self, comando: str) -> TestResult:
         """Executa comando no dispositivo com detecção de porta ocupada"""
+        manager = None
         try:
             if not self.porta:
                 self.porta = SerialPortManager.detectar_porta()
@@ -1212,7 +1219,6 @@ class TestHandler:
             manager.escrever(comando)
             time.sleep(0.5)
             resposta = manager.ler()
-            manager.fechar()
 
             return TestResult(
                 comando=comando.strip(), sucesso=True,
@@ -1230,6 +1236,9 @@ class TestHandler:
                 comando=comando.strip(), sucesso=False,
                 erro=str(e), porta=self.porta
             )
+        finally:
+            if manager:
+                manager.fechar()
 
     def teste_10s(self) -> TestResult:
         return self.executar_comando(CommandProtocol.formatar_teste_10s())
@@ -1500,37 +1509,25 @@ class NobreakAPIHandler(BaseHTTPRequestHandler):
         commands_sent = []
 
         if 'beep' in params:
-            desired_beep = int(params['beep'])
-            # Read current state
-            resposta = monitor._executar_serial("Q1\r")
-            if not resposta:
+            try:
+                desired_beep = int(params['beep'])
+            except (TypeError, ValueError):
+                self._send_json({'success': False, 'error': 'Valor de beep inválido (use 0 ou 1)'}, 400)
+                return
+            if desired_beep not in (0, 1):
+                self._send_json({'success': False, 'error': 'beep deve ser 0 (desativado) ou 1 (ativado)'}, 400)
+                return
+
+            # Leitura + toggle são atômicos (um único lock serial) — evita que
+            # duas requisições simultâneas enviem toggles duplicados.
+            sucesso, mensagem = monitor.escrever_beep(desired_beep)
+            if not sucesso:
                 self._send_json({
-                    'success': False, 'error': 'Não foi possível ler estado atual',
+                    'success': False, 'error': mensagem,
                     'timestamp': datetime.now().isoformat(),
                 })
                 return
-
-            status = monitor.parse_status(resposta)
-            if not status:
-                self._send_json({
-                    'success': False, 'error': 'Resposta inválida ao ler estado',
-                    'timestamp': datetime.now().isoformat(),
-                })
-                return
-
-            current_beep = 1 if status.beep_on else 0
-            if current_beep != desired_beep:
-                result = monitor._executar_serial("Q\r")
-                if result is not None:
-                    commands_sent.append('Toggle beep (Q)')
-                else:
-                    self._send_json({
-                        'success': False, 'error': 'Falha ao enviar toggle beep',
-                        'timestamp': datetime.now().isoformat(),
-                    })
-                    return
-            else:
-                commands_sent.append(f'Beep já no estado desejado ({desired_beep})')
+            commands_sent.append(mensagem)
 
         if not commands_sent:
             self._send_json({
@@ -1599,7 +1596,7 @@ class NobreakAPIHandler(BaseHTTPRequestHandler):
                     self._send_json({
                         'success': True,
                         'test_type': 'firmware',
-                        'command': 'I',
+                        'command': 'F',
                         'response': firmware,
                         'port': monitor.porta if monitor else None,
                         'timestamp': datetime.now().isoformat(),
@@ -1637,11 +1634,27 @@ class NobreakAPIHandler(BaseHTTPRequestHandler):
                     params = json.loads(body.decode('utf-8'))
                 except Exception:
                     params = {}
-                minutes = int(params.get('minutes', 1))
-                if test_type == 'timed':
-                    comando = CommandProtocol.formatar_teste_temporizado(minutes)
-                else:
-                    comando = CommandProtocol.formatar_shutdown(minutes)
+                try:
+                    minutes = int(params.get('minutes', 1))
+                except (TypeError, ValueError):
+                    self._send_json({
+                        'success': False,
+                        'error': "Parâmetro 'minutes' inválido (use um inteiro de 0 a 99)",
+                        'test_type': test_type,
+                    }, 400)
+                    return
+                try:
+                    if test_type == 'timed':
+                        comando = CommandProtocol.formatar_teste_temporizado(minutes)
+                    else:
+                        comando = CommandProtocol.formatar_shutdown(minutes)
+                except ValidationError as ve:
+                    self._send_json({
+                        'success': False,
+                        'error': str(ve),
+                        'test_type': test_type,
+                    }, 400)
+                    return
                 result = monitor.executar_comando_api(comando)
                 data = {
                     'success': result.sucesso,
@@ -1708,9 +1721,7 @@ def start_api_server(host: str, port: int, monitor: 'NobreakMonitor',
 
     server = ThreadingHTTPServer((host, port), NobreakAPIHandler)
     server.daemon_threads = True
-    # Disable reverse DNS lookups on incoming connections — this is a major
-    # latency source (can add seconds per request if DNS is slow or unavailable).
-    server.address_family = socket.AF_INET
+    # Nota: reverse DNS já é evitado pelo override de address_string() no handler.
     thread = threading.Thread(target=server.serve_forever, daemon=True, name='api-server')
     thread.start()
 
@@ -1761,10 +1772,18 @@ class NobreakMonitor:
         self.start_time: float = 0
         self.running = True
 
+        # Evento de parada: permite shutdown imediato (sinal/Ctrl+C) sem
+        # esperar o time.sleep do intervalo de polling terminar.
+        self._stop_event = threading.Event()
         # Lock to serialize COM port access between monitoring loop and API commands
         self._serial_lock = threading.Lock()
         # Cached firmware string (fetched once and reused)
         self._firmware: Optional[str] = None
+
+    def parar(self):
+        """Solicita a parada do monitor (thread-safe, pode ser chamado de signal handler)."""
+        self.running = False
+        self._stop_event.set()
 
     def parse_status(self, resposta: str) -> Optional[NobreakStatus]:
         """Parse da resposta Q1 para NobreakStatus"""
@@ -1801,43 +1820,85 @@ class NobreakMonitor:
             logger.error(f"Erro ao fazer parse do status: {e}")
             return None
 
+    def _ensure_porta_unlocked(self):
+        """Garante que a porta foi detectada.
+        DEVE ser chamada com _serial_lock já adquirido — a detecção envia
+        comandos Q1 às portas, portanto não pode correr em paralelo com
+        outra operação serial deste processo.
+        """
+        if not self.porta:
+            self.porta = SerialPortManager.detectar_porta()
+
+    def _executar_serial_unlocked(self, comando: str) -> Optional[str]:
+        """Executa comando serial SEM adquirir o lock (o chamador deve possuí-lo).
+        Retorna a string de resposta, ou None em caso de falha.
+        """
+        manager = None
+        try:
+            self._ensure_porta_unlocked()
+            manager = SerialPortManager(self.porta)
+            manager.abrir_com_retry(
+                timeout=self.timeout,
+                busy_max_retries=self.busy_max_retries,
+                busy_retry_delay=self.busy_retry_delay
+            )
+            manager.escrever(comando)
+            time.sleep(0.1)  # brief pause for UPS to start responding
+            return manager.ler(timeout=2.0)  # 2s is plenty at 2400 baud
+        except PortBusyError:
+            logger.warning("Porta ocupada — pulando este ciclo (outro processo pode estar usando a porta)")
+            return None
+        except SerialError as e:
+            logger.error(f"Erro serial: {e}")
+            return None
+        finally:
+            # Sempre fecha a porta, mesmo em caso de exceção — um handle vazado
+            # deixaria a porta "ocupada" para todos os ciclos seguintes.
+            if manager:
+                manager.fechar()
+
     def _executar_serial(self, comando: str) -> Optional[str]:
         """Executa comando serial com retry de porta ocupada.
         Retorna a string de resposta, ou None em caso de falha.
         Thread-safe: uses _serial_lock to serialize COM port access.
         """
         with self._serial_lock:
-            try:
-                manager = SerialPortManager(self.porta)
-                manager.abrir_com_retry(
-                    timeout=self.timeout,
-                    busy_max_retries=self.busy_max_retries,
-                    busy_retry_delay=self.busy_retry_delay
-                )
-                manager.escrever(comando)
-                time.sleep(0.1)  # brief pause for UPS to start responding
-                resposta = manager.ler(timeout=2.0)  # 2s is plenty at 2400 baud
-                manager.fechar()
-                return resposta
-            except PortBusyError:
-                logger.warning("Porta ocupada — pulando este ciclo (outro processo pode estar usando a porta)")
-                return None
-            except SerialError as e:
-                logger.error(f"Erro serial: {e}")
-                return None
+            return self._executar_serial_unlocked(comando)
+
+    def escrever_beep(self, desired_beep: int) -> tuple:
+        """Lê o estado atual do beep e envia o toggle se necessário.
+
+        A sequência leitura→toggle é ATÔMICA: o _serial_lock é mantido durante
+        as duas operações. Sem isso, duas requisições simultâneas de escrita
+        poderiam ler o mesmo estado e ambas enviarem o toggle, deixando o beep
+        no estado oposto ao desejado (TOCTOU race).
+
+        Retorna (sucesso: bool, mensagem: str).
+        """
+        with self._serial_lock:
+            resposta = self._executar_serial_unlocked("Q1\r")
+            if not resposta:
+                return (False, 'Não foi possível ler estado atual')
+
+            status = self.parse_status(resposta)
+            if not status:
+                return (False, 'Resposta inválida ao ler estado')
+
+            current_beep = 1 if status.beep_on else 0
+            if current_beep == desired_beep:
+                return (True, f'Beep já no estado desejado ({desired_beep})')
+
+            result = self._executar_serial_unlocked("Q\r")
+            if result is None:
+                return (False, 'Falha ao enviar toggle beep')
+            return (True, 'Toggle beep (Q)')
 
     def executar_comando_api(self, comando: str) -> TestResult:
         """Executes a command through the monitor's serial lock.
         Used by the HTTP API to avoid COM port contention.
         Waits for the monitor's current serial operation to finish first.
+        Port auto-detection (if needed) also happens under the lock.
         """
-        if not self.porta:
-            try:
-                self.porta = SerialPortManager.detectar_porta()
-            except Exception as e:
-                return TestResult(comando=comando.strip(), sucesso=False,
-                                  erro=str(e), porta=self.porta)
-
         resposta = self._executar_serial(comando)
         if resposta is not None:
             return TestResult(comando=comando.strip(), sucesso=True,
@@ -1861,9 +1922,7 @@ class NobreakMonitor:
         """Lê status atual do nobreak com retries"""
         for tentativa in range(self.retries):
             try:
-                if not self.porta:
-                    self.porta = SerialPortManager.detectar_porta()
-
+                # Detecção de porta (se necessária) ocorre dentro do lock serial
                 resposta = self._executar_serial("Q1\r")
                 if resposta:
                     status = self.parse_status(resposta)
@@ -1884,16 +1943,23 @@ class NobreakMonitor:
         return None
 
     def enviar_notificacao(self, assunto: str, mensagem: str):
+        """Envia e-mail em thread separada para não bloquear o loop de polling.
+
+        Um servidor SMTP lento/inacessível (comum justamente durante quedas de
+        energia!) travaria o monitoramento por até 60s se enviado inline.
+        """
         if self.email_sender:
             logger.info(f"Enviando e-mail: {assunto}")
-            self.email_sender.enviar(assunto, mensagem)
+            threading.Thread(
+                target=self.email_sender.enviar,
+                args=(assunto, mensagem),
+                daemon=True,
+                name='email-sender'
+            ).start()
 
     def executar_teste_10s(self) -> bool:
         """Executa teste de 10 segundos no nobreak"""
         try:
-            if not self.porta:
-                self.porta = SerialPortManager.detectar_porta()
-
             resposta = self._executar_serial("T\r")
             if resposta is not None:
                 print_success("[OK] Teste de 10 segundos iniciado")
@@ -2031,7 +2097,7 @@ class NobreakMonitor:
         # Registra handlers de sinal para shutdown graceful (NSSM envia SIGTERM)
         def _signal_handler(signum, frame):
             logger.info(f"Sinal {signum} recebido, encerrando...")
-            self.running = False
+            self.parar()
 
         signal.signal(signal.SIGTERM, _signal_handler)
         signal.signal(signal.SIGINT, _signal_handler)
@@ -2043,6 +2109,9 @@ class NobreakMonitor:
                 self.verificar_teste_agendado()
 
                 status = self.ler_status()
+
+                if not self.running:
+                    break
 
                 if status:
                     print_status_line(status)
@@ -2063,11 +2132,14 @@ class NobreakMonitor:
                             f"Falhas consecutivas: {self.consecutive_failures}"
                         )
 
-                time.sleep(self.poll_interval)
+                # Aguarda o intervalo de polling, mas acorda imediatamente
+                # se a parada for solicitada (sinal/Ctrl+C).
+                if self._stop_event.wait(self.poll_interval):
+                    break
 
         except KeyboardInterrupt:
             print_info("\n\nMonitoramento interrompido pelo usuário")
-            self.running = False
+            self.parar()
 
 
 # ============================================================================
@@ -2187,6 +2259,7 @@ def handle_config_read(args, formatter: OutputFormatter, config: AppConfig) -> i
         busy_delay = config.getfloat('serial', 'busy_retry_delay', fallback=2.0)
 
         for tentativa in range(retries):
+            manager = None
             try:
                 manager = SerialPortManager(porta)
                 manager.abrir_com_retry(
@@ -2198,7 +2271,6 @@ def handle_config_read(args, formatter: OutputFormatter, config: AppConfig) -> i
                 manager.escrever("Q1\r")
                 time.sleep(0.5)
                 resposta = manager.ler(timeout=timeout)
-                manager.fechar()
 
                 if not resposta:
                     if tentativa < retries - 1:
@@ -2242,6 +2314,9 @@ def handle_config_read(args, formatter: OutputFormatter, config: AppConfig) -> i
                     time.sleep(1)
                     continue
                 raise
+            finally:
+                if manager:
+                    manager.fechar()
 
     except PortBusyError as e:
         return ErrorHandler.tratar_erro_porta_ocupada(e, formatter)
@@ -2276,7 +2351,7 @@ def handle_config_write(args, formatter: OutputFormatter, config: AppConfig) -> 
 
         if args.beep is not None:
             if args.beep not in (0, 1):
-                raise ValidationError("beep deve ser 0 (ativado) ou 1 (desativado)")
+                raise ValidationError("beep deve ser 0 (desativado) ou 1 (ativado)")
 
             timeout = config.getfloat('serial', 'timeout', fallback=5.0)
             retries = config.getint('serial', 'retries', fallback=5)
@@ -2291,6 +2366,7 @@ def handle_config_write(args, formatter: OutputFormatter, config: AppConfig) -> 
                 porta = SerialPortManager.detectar_porta()
 
             for tentativa in range(retries):
+                manager = None
                 try:
                     manager = SerialPortManager(porta)
                     manager.abrir_com_retry(
@@ -2299,12 +2375,13 @@ def handle_config_write(args, formatter: OutputFormatter, config: AppConfig) -> 
                         busy_retry_delay=busy_delay
                     )
 
+                    # Leitura e toggle acontecem com a porta aberta continuamente,
+                    # impedindo que outro processo intercale comandos no meio.
                     manager.escrever("Q1\r")
                     time.sleep(0.5)
                     resposta = manager.ler(timeout=timeout)
 
                     if not resposta:
-                        manager.fechar()
                         if tentativa < retries - 1:
                             if not formatter.quiet:
                                 print_warning(f"Tentativa {tentativa + 1} falhou, tentando novamente...")
@@ -2316,7 +2393,6 @@ def handle_config_write(args, formatter: OutputFormatter, config: AppConfig) -> 
                     parts = clean.split()
 
                     if len(parts) < 8:
-                        manager.fechar()
                         if tentativa < retries - 1:
                             if not formatter.quiet:
                                 print_warning("Resposta inválida, tentando novamente...")
@@ -2336,7 +2412,6 @@ def handle_config_write(args, formatter: OutputFormatter, config: AppConfig) -> 
                         if not formatter.quiet:
                             print_info(f"Beep já está no estado desejado ({args.beep})")
 
-                    manager.fechar()
                     break
 
                 except PortBusyError as e:
@@ -2348,6 +2423,9 @@ def handle_config_write(args, formatter: OutputFormatter, config: AppConfig) -> 
                         time.sleep(1)
                         continue
                     raise
+                finally:
+                    if manager:
+                        manager.fechar()
 
         if not comandos_enviados and args.beep is None:
             raise ValidationError("Nenhum parâmetro válido especificado. Use 'tsshara-cli write --help'")
@@ -2713,12 +2791,12 @@ def _interactive_write(formatter, config):
     """Interactive: write UPS config"""
     print()
     print_info("Configurações disponíveis para escrita:")
-    print("  1. Beep (0=ativado, 1=desativado)")
+    print("  1. Beep (1=ativado, 0=desativado)")
     print()
     choice = _input_prompt("Escolha", "1")
 
     if choice == '1':
-        beep_val = _input_prompt("Valor do beep (0=ativado, 1=desativado)", "")
+        beep_val = _input_prompt("Valor do beep (1=ativado, 0=desativado)", "")
         if beep_val in ('0', '1'):
             porta = _input_prompt("Porta serial (Enter para auto)", "")
             args = argparse.Namespace(
@@ -3119,7 +3197,7 @@ Códigos de saída:
     write_parser.add_argument('--port', metavar='PORTA', default=None,
                              help='Porta serial (ex: COM3, auto-detecta se omitido)')
     write_parser.add_argument('--beep', type=int, choices=[0, 1], metavar='0|1',
-                             help='Beep (0=ativado, 1=desativado)')
+                             help='Beep (1=ativado, 0=desativado)')
 
     # --- test ---
     test_parser = subparsers.add_parser('test', help='Enviar comandos de teste ao nobreak', parents=[global_parser])

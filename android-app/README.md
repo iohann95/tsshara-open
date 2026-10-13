@@ -71,9 +71,9 @@ app/src/main/java/com/tsshara/app/
 ├── network/
 │   └── ApiClient.kt         # Cliente HTTP — chamadas à API REST
 ├── service/
-│   ├── NotificationHelper.kt # Notificações — canal + envio
-│   ├── UpsMonitorWorker.kt   # WorkManager — polling periódico em background
-│   └── BootReceiver.kt       # BroadcastReceiver — re-agenda após reboot
+│   ├── NotificationHelper.kt  # Notificações — canal + envio
+│   ├── UpsMonitorService.kt   # Foreground service — polling contínuo em background
+│   └── BootReceiver.kt        # BroadcastReceiver — reinicia o serviço após reboot
 └── ui/
     ├── StatusScreen.kt       # Tela de status do nobreak
     ├── SettingsScreen.kt     # Tela de configurações

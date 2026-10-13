@@ -1,19 +1,21 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
+    // AGP 9+ has built-in Kotlin support — the kotlin-android plugin is no longer applied
     alias(libs.plugins.kotlin.compose)
 }
 
 android {
     namespace = "com.tsshara.app"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.tsshara.app"
         minSdk = 35
-        targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        targetSdk = 37
+        versionCode = 2
+        versionName = "1.1.0"
     }
 
     buildTypes {
@@ -32,8 +34,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
+    kotlin {
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_17)
+        }
     }
 
     buildFeatures {

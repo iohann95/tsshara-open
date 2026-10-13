@@ -137,6 +137,12 @@
     <string name="settings_notif_connection_restored">✅ Connection Restored</string>
     <string name="settings_notif_test_running">🔄 Test in Progress</string>
 
+    <!-- Battery optimization -->
+    <string name="settings_battery_opt_title">Background reliability</string>
+    <string name="settings_battery_opt_desc">Android battery optimization may suspend monitoring and delay alerts. Exempt this app so monitoring keeps running in the background.</string>
+    <string name="settings_battery_opt_button">Disable battery optimization</string>
+    <string name="settings_battery_opt_ok">✅ Battery optimization is disabled — background monitoring is reliable</string>
+
     <!-- Notifications -->
     <string name="notif_channel_name">UPS Alerts</string>
     <string name="notif_channel_desc">Notifications about UPS status changes</string>
